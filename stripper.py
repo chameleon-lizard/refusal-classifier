@@ -2,12 +2,13 @@ import os
 import tarfile
 import urllib.request
 import urllib.error
+import transformers
 from collections import Counter
 
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoConfig, AutoModel, AutoTokenizer, BertModel, RobertaModel, PreTrainedTokenizerFast
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, AutoTokenizer, BertModel, RobertaModel, PreTrainedTokenizerFast
 from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
 
 def msize(model):
@@ -33,10 +34,10 @@ def embed(sentences, model, tokenizer, device):
     with torch.no_grad():
         model_output = model(**encoded_input, output_hidden_states=True)
 
-        if isinstance(model, BertModel):
+        if isinstance(model, BertModel) or isinstance(model, transformers.BertForSequenceClassification):
             # For Bert-like models, use the last hidden state
             embeddings = model_output.hidden_states[-1][:, 0, :]  # [batch_size, hidden_size]
-        elif isinstance(model, RobertaModel):
+        elif isinstance(model, RobertaModel) or isinstance(model, transformers.RobertaForSequenceClassification):
             # For Roberta-like models, use the last hidden state
              embeddings = model_output.hidden_states[-1][:, 0, :]  # [batch_size, hidden_size]
         else:
@@ -46,24 +47,27 @@ def embed(sentences, model, tokenizer, device):
 
     return embeddings.cpu().numpy()
 
-def download_and_extract_corpora(corpus_urls, corpus_dir_prefix="corpus"):
+def download_and_extract_corpora(corpus_urls, data_dir="data"):
     """
-    Downloads and extracts corpora from provided URLs.
+    Downloads and extracts corpora from provided URLs to the data directory.
 
     Parameters:
         corpus_urls (list): List of URLs for corpora.
-        corpus_dir_prefix (str): Prefix for the directory names where corpora will be stored.
+        data_dir (str): The directory where corpora data will be stored.
 
     Returns:
         dict: A dictionary where keys are language codes and values are directory paths to corpus data.
     """
     corpus_dirs = {}
 
+    # Create the data directory if it doesn't exist
+    os.makedirs(data_dir, exist_ok=True)
+
     for url in tqdm(corpus_urls, desc="Processing corpus URLs"):
         filename = os.path.basename(url)
         language_code = filename.split("-")[0]  # Extract language code from filename
-        corpus_file = f"{corpus_dir_prefix}_{language_code}.tar.gz"
-        corpus_dir = filename.replace(".tar.gz", "")
+        corpus_file = os.path.join(data_dir, f"{language_code}.tar.gz")
+        corpus_dir = os.path.join(data_dir, filename.replace(".tar.gz", ""))
 
         # Download the corpus if not already downloaded
         if not os.path.exists(corpus_file):
@@ -82,7 +86,7 @@ def download_and_extract_corpora(corpus_urls, corpus_dir_prefix="corpus"):
             print(f"Extracting '{corpus_file}'...")
             try:
                 with tarfile.open(corpus_file, "r:gz") as tar:
-                    tar.extractall()
+                    tar.extractall(path=data_dir)
                 print(f"Extracted to '{corpus_dir}'.")
             except tarfile.TarError as e:
                 print(f"Failed to extract {corpus_file}. Error: {e}")
@@ -159,20 +163,20 @@ def create_new_embedding(old_model, new_vocab_size, hidden_size, selected_vocab,
     Handles both Bert and Roberta models.
     """
 
-    if isinstance(old_model, BertModel):
+    if isinstance(old_model, BertModel) or isinstance(old_model, transformers.BertForSequenceClassification):
          new_embedding = torch.nn.Embedding(
             num_embeddings=new_vocab_size,
             embedding_dim=hidden_size,
             padding_idx=0,
-        ).to(device)
-         new_embedding.weight.data.copy_(old_model.embeddings.word_embeddings.weight[selected_vocab, :].to(device))
-    elif isinstance(old_model, RobertaModel):
+         ).to(device)
+         new_embedding.weight.data.copy_(old_model.bert.embeddings.word_embeddings.weight[selected_vocab, :].to(device))
+    elif isinstance(old_model, RobertaModel) or isinstance(old_model, transformers.RobertaForSequenceClassification):
           new_embedding = torch.nn.Embedding(
               num_embeddings=new_vocab_size,
               embedding_dim=hidden_size,
               padding_idx=1,  # Roberta uses padding index 1
           ).to(device)
-          new_embedding.weight.data.copy_(old_model.embeddings.word_embeddings.weight[selected_vocab, :].to(device))
+          new_embedding.weight.data.copy_(old_model.roberta.embeddings.word_embeddings.weight[selected_vocab, :].to(device))
     else:
         raise ValueError("Unsupported model type: must be Bert or Roberta")
 
@@ -217,33 +221,35 @@ def create_new_tokenizer(tokenizer, resulting_vocab, new_model_name, vocab_size 
     wrapped_tokenizer.save_pretrained(new_model_name)
     return wrapped_tokenizer
 
-def main():
-    """Main function to strip the model and save it."""
-    MODEL_NAME = "./refusal_classifier_tiny"  # or "intfloat/multilingual-e5-small" if you start from that
-    NEW_MODEL_NAME = "refusal_classifier_tiny_stripped"
-    VOCAB_THRESHOLD = 5
-    CORPUS_URLS = [
+def strip_model(
+    model_name,
+    new_model_name,
+    vocab_threshold=5,
+    corpus_urls = [
         "https://downloads.wortschatz-leipzig.de/corpora/rus-ru_web-public_2019_1M.tar.gz",  # Russian corpus
         "https://downloads.wortschatz-leipzig.de/corpora/eng-com_web-public_2018_1M.tar.gz",  # English corpus
         "https://downloads.wortschatz-leipzig.de/corpora/deu-com_web_2021_1M.tar.gz",  # German corpus
         "https://downloads.wortschatz-leipzig.de/corpora/fra-ca_web_2020_300K.tar.gz",  # French corpus
         "https://downloads.wortschatz-leipzig.de/corpora/spa-ve_web_2016_300K.tar.gz",  # Spanish corpus
-    ]
+    ],
+     vocab_size = 80000
+):
+    """Main function to strip the model and save it."""
 
     # Determine if CUDA (GPU) is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Load the original tokenizer and model config
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    config = AutoConfig.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name)
 
     # Create the big model, transfer to device, and use it to generate the new embeddings
-    big_model = AutoModel.from_pretrained(MODEL_NAME).to(device)
+    big_model = AutoModelForSequenceClassification.from_pretrained(model_name).to(device)
     hidden_size = big_model.config.hidden_size
 
-    # Download and extract corpora
-    corpus_dirs = download_and_extract_corpora(CORPUS_URLS)
+    # Download and extract corpora to the data/ directory
+    corpus_dirs = download_and_extract_corpora(corpus_urls, data_dir="data")
 
     # Collect all the sentences from available languages.
     all_sentences = []
@@ -267,7 +273,7 @@ def main():
         tokenizer.vocab[k] for k in tokenizer.special_tokens_map.values()
     }  # Add special tokens
     for k, v in cnt.items():
-        if v >= VOCAB_THRESHOLD or k <= 3_000:
+        if v >= vocab_threshold or k <= 3_000:
             resulting_vocab.add(k)  # Add frequent and low-id tokens
 
     resulting_vocab = sorted(resulting_vocab)
@@ -276,9 +282,9 @@ def main():
     new_size = len(resulting_vocab)
 
     # Save the new vocabulary
-    os.makedirs(NEW_MODEL_NAME, exist_ok=True)
+    os.makedirs(new_model_name, exist_ok=True)
     inv_voc = {idx: word for word, idx in tokenizer.vocab.items()}
-    with open(os.path.join(NEW_MODEL_NAME, "vocab.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(new_model_name, "vocab.txt"), "w", encoding="utf-8") as f:
         for idx in resulting_vocab:
             f.write(inv_voc[idx] + "\n")
 
@@ -286,39 +292,40 @@ def main():
     new_embedding = create_new_embedding(big_model, new_size, hidden_size, resulting_vocab, device)
 
     # Initialize a new model from the original model's config, but replace the embeddings
-    small_model = AutoModel.from_pretrained(MODEL_NAME).to(device) # Load the original model
-    small_model.config.vocab_size = new_size # Update the vocab size in the config
-
+    small_model = AutoModelForSequenceClassification.from_config(config).to(device) # Create a new model from the config
+    
     # Replace the embeddings layer with the new one for both Bert and Roberta
-    if isinstance(small_model, BertModel):
-        small_model.embeddings.word_embeddings = new_embedding
-    elif isinstance(small_model, RobertaModel):
-        small_model.embeddings.word_embeddings = new_embedding
+    if isinstance(small_model, BertModel) or isinstance(small_model, transformers.BertForSequenceClassification):
+        small_model.bert.embeddings.word_embeddings = new_embedding
+    elif isinstance(small_model, RobertaModel) or isinstance(small_model, transformers.RobertaForSequenceClassification):
+        small_model.roberta.embeddings.word_embeddings = new_embedding
     else:
         raise ValueError("Unsupported model type: must be Bert or Roberta")
-
-    small_model.tie_weights()
-    # small_model.to(device) # Model is already on the device
+        
+    # Copy the classification head from the old model to the new one
+    small_model.classifier.load_state_dict(big_model.classifier.state_dict())
+    
+    small_model.config.vocab_size = new_size # Update the vocab size in the config
 
     print(f"Original model size: {msize(big_model):,}")
     print(f"New model size: {msize(small_model):,}")
 
-    print(f"New Embedding layer size: {msize(small_model.embeddings):,}")
-    print(f"New Encoder layer size: {msize(small_model.encoder):,}")
+    print(f"New Embedding layer size: {msize(small_model.bert.embeddings if isinstance(small_model, BertForSequenceClassification) else small_model.roberta.embeddings):,}")
+    print(f"New Encoder layer size: {msize(small_model.bert.encoder if isinstance(small_model, BertForSequenceClassification) else small_model.roberta.encoder):,}")
 
     print(f"Size ratio new/old: {msize(small_model) / msize(big_model):.2f}")
 
     # Create the new tokenizer from vocabulary
-    new_tokenizer = create_new_tokenizer(tokenizer, resulting_vocab, NEW_MODEL_NAME, vocab_size = 80000)
+    new_tokenizer = create_new_tokenizer(tokenizer, resulting_vocab, new_model_name, vocab_size = vocab_size)
 
     # Save the stripped model
-    small_model.save_pretrained(NEW_MODEL_NAME)
+    small_model.save_pretrained(new_model_name)
 
     print("Saved stripped model.")
 
     # Check the new model (optional)
-    tokenizer = AutoTokenizer.from_pretrained(NEW_MODEL_NAME)
-    model = AutoModel.from_pretrained(NEW_MODEL_NAME).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(new_model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(new_model_name).to(device)
 
     text = "This is a test sentence in English and also a test предложение на русском."
     inputs = tokenizer(text, return_tensors="pt").to(device)
@@ -328,7 +335,7 @@ def main():
     e_new = embed(texts, model, tokenizer, device)
 
     #Load the old model for comparison.
-    big_model = AutoModel.from_pretrained(MODEL_NAME).to(device)
+    big_model = AutoModelForSequenceClassification.from_pretrained(model_name).to(device)
     e_old = embed(texts, big_model, tokenizer, device)
 
     print(f"New embeddings shape: {e_new.shape}, old embeddings shape: {e_old.shape}")
@@ -339,4 +346,33 @@ def main():
     print(f"Cosine similarity between old and new: { (e_new * e_old).sum(1)}")
 
 if __name__ == "__main__":
-    main()
+    
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Strip a transformer model and create a new smaller version.")
+    parser.add_argument("--model_name", type=str, default="./refusal_classifier_tiny", 
+                        help="Name of the model to strip.")
+    parser.add_argument("--new_model_name", type=str, default="refusal_classifier_tiny_stripped", 
+                        help="Name of the model to save the stripped model.")
+    parser.add_argument("--vocab_threshold", type=int, default=5,
+                        help="Minimum token frequency to keep in vocab.")
+    parser.add_argument("--vocab_size", type=int, default=80000,
+                        help="New tokenizer's vocab size.")
+    parser.add_argument("--corpus_urls", type=str, nargs='+',
+                        default=[
+                            "https://downloads.wortschatz-leipzig.de/corpora/rus-ru_web-public_2019_1M.tar.gz",
+                            "https://downloads.wortschatz-leipzig.de/corpora/eng-com_web-public_2018_1M.tar.gz",
+                            "https://downloads.wortschatz-leipzig.de/corpora/deu-com_web_2021_1M.tar.gz",
+                            "https://downloads.wortschatz-leipzig.de/corpora/fra-ca_web_2020_300K.tar.gz",
+                            "https://downloads.wortschatz-leipzig.de/corpora/spa-ve_web_2016_300K.tar.gz",
+                        ],
+                        help="URLs of the corpora to use for stripping.")
+    args = parser.parse_args()
+    
+    strip_model(
+        model_name = args.model_name,
+        new_model_name = args.new_model_name,
+        vocab_threshold = args.vocab_threshold,
+        corpus_urls = args.corpus_urls,
+        vocab_size = args.vocab_size
+    )
